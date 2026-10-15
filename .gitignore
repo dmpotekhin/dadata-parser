@@ -2,6 +2,11 @@
 __pycache__/
 *.py[cod]
 
+# Секреты: реальный токен DaData живёт только в .env, в git он не попадает
+.env
+.env.*
+!.env.example
+
 # Состояние прогонов: суточный счётчик, кэш ИНН, lock-файл
 dadata_state.json
 *_state.json

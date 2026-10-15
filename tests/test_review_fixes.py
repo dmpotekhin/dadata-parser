@@ -12,6 +12,8 @@
   7. http на внешний хост запрещён (иначе токен уходил бы открытым текстом).
   8. Сетевые ошибки попадают в счётчик обращений с повторами.
   9. Смена суток сбрасывает счётчик, но сохраняет кэш.
+ 10. Токен читается из .env рядом со скриптом; переменная окружения имеет приоритет,
+     а сам токен не попадает в state-файл.
 
 Запуск: python3 -m unittest discover -s tests -v
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -215,6 +218,54 @@ class ReviewFixesTest(unittest.TestCase):
             sheet = read_sheets(tmp_path / "o.xlsx")["Все"]
             self.assertEqual(str(sheet["Статус"].iloc[0]), "error")
             self.assertIn("network_error", str(sheet["Ошибка"].iloc[0]))
+
+    # ---------- 10. токен из .env ----------
+
+    def test_token_from_env_file_and_env_var_priority(self) -> None:
+        """
+        .env рядом со скриптом читается, но переменная окружения его перебивает.
+
+        Скрипт копируется в отдельную папку: python-dotenv ищет .env от каталога
+        скрипта и вверх по дереву, поэтому тест в общей папке проекта подхватил бы
+        и чужой .env, и .env разработчика.
+        """
+        with tempfile.TemporaryDirectory() as tmp, MockDaData() as mock:
+            tmp_path = Path(tmp)
+            shutil.copy(REPO / "dadata_okved_filter.py", tmp_path / "dadata_okved_filter.py")
+            make_input(tmp_path / "in.xlsx", [("A", "7707083893")])
+            file_token = "fromenvfile1234567890"
+            env_token = "fromenvironment0987654321"
+            (tmp_path / ".env").write_text(
+                f"DADATA_TOKEN={file_token}\nDADATA_API_URL={mock.url}\n", encoding="utf-8")
+            clean_env = {k: v for k, v in os.environ.items() if not k.startswith("DADATA_")}
+            cmd = [sys.executable, "dadata_okved_filter.py", "--input", "in.xlsx",
+                   "--output", "out.xlsx", "--state-file", "state.json",
+                   "--max-per-minute", "120", "--sleep", "0", "--verbose"]
+
+            def mask(token: str) -> str:
+                return f"{token[:4]}...{token[-4:]}"
+
+            with_env_file = subprocess.run(cmd, cwd=str(tmp_path), env=clean_env,
+                                           capture_output=True, text=True, timeout=60)
+            self.assertEqual(with_env_file.returncode, 0,
+                             with_env_file.stdout + with_env_file.stderr)
+            self.assertIn(mask(file_token), with_env_file.stdout,
+                          "токен должен браться из .env")
+            self.assertNotIn(file_token, (tmp_path / "state.json").read_text(encoding="utf-8"))
+
+            env_wins = subprocess.run(cmd, cwd=str(tmp_path),
+                                      env=dict(clean_env, DADATA_TOKEN=env_token),
+                                      capture_output=True, text=True, timeout=60)
+            self.assertEqual(env_wins.returncode, 0, env_wins.stdout + env_wins.stderr)
+            self.assertIn(mask(env_token), env_wins.stdout,
+                          "переменная окружения имеет приоритет над .env")
+            self.assertNotIn(mask(file_token), env_wins.stdout)
+
+            (tmp_path / ".env").unlink()
+            without_token = subprocess.run(cmd, cwd=str(tmp_path), env=clean_env,
+                                           capture_output=True, text=True, timeout=60)
+            self.assertEqual(without_token.returncode, 1)
+            self.assertIn("Не задан токен", without_token.stdout + without_token.stderr)
 
 
 if __name__ == "__main__":

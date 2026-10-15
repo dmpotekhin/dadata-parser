@@ -23,9 +23,26 @@ pip install -r requirements.txt
 ## Токен DaData
 
 Токен НЕ хранится в коде. Возьмите его в личном кабинете DaData
-(<https://dadata.ru/profile/#info>) и задайте одним из способов:
+(<https://dadata.ru/profile/#info>).
 
-**Переменная окружения (рекомендуется)** — не попадает в историю команд:
+**Рекомендуется: файл `.env` рядом со скриптом.** Скрипт читает его сам
+(`python-dotenv` из `requirements.txt`), токен не попадает ни в историю команд,
+ни в список процессов:
+
+```bash
+cp .env.example .env
+chmod 600 .env                       # читать может только владелец
+# затем откройте .env в редакторе и вставьте токен:
+# DADATA_TOKEN=ваш_токен
+```
+
+Файл `.env` уже в `.gitignore` (как и `.env.local` и прочие `.env.*`), шаблон
+`.env.example` — в репозитории, самого токена в нём нет.
+
+Приоритет источников: `--token` → переменная окружения `DADATA_TOKEN` → `.env`
+(уже заданная переменная окружения никогда не перезаписывается файлом).
+
+**Альтернатива: переменная окружения** (удобно на сервере/в CI):
 
 ```bash
 export DADATA_TOKEN="ваш_токен"            # Linux/macOS
@@ -33,19 +50,17 @@ set DADATA_TOKEN=ваш_токен                 # Windows cmd
 $env:DADATA_TOKEN="ваш_токен"              # Windows PowerShell
 ```
 
-Либо создайте файл `.env` рядом со скриптом (нужен `python-dotenv`, он есть в
-`requirements.txt`):
+**Альтернатива для macOS: Keychain** (токена нет на диске в открытом виде):
 
+```bash
+security add-generic-password -a "$USER" -s dadata-token -w 'ваш_токен' -U
+DADATA_TOKEN="$(security find-generic-password -a "$USER" -s dadata-token -w)" \
+  python3 dadata_okved_filter.py --input inn.xlsx --output result.xlsx
 ```
-DADATA_TOKEN=ваш_токен
-```
 
-Либо передайте параметром `--token ваш_токен` (учтите, что он попадёт в историю
-команд и в список процессов; в логах токен всегда маскируется — `abcd...7890`).
-
-Для собственного списка ИНН: файл `.env` в репозиторий не коммитить. Если хотите
-вести репозиторий через git — добавьте `.env`, `*_dadata.xlsx`, `dadata_state.json`
-в `.gitignore`.
+**Не рекомендуется: `--token ваш_токен`** — попадает в историю команд и в список
+процессов. В любом случае в логах токен всегда маскируется (`abcd...7890`), а в
+выходной файл и state-файл не пишется вовсе.
 
 ## Запуск
 
