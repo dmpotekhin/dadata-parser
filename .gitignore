@@ -10,3 +10,5 @@ dadata_state.json
 # Результаты прогонов (входной inn.xlsx и выходные отчёты)
 inn_okved*.xlsx
 *_dryrun.xlsx
+# CodeGraph local index (per-machine, do not commit)
+.codegraph/
