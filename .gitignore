@@ -1,0 +1,12 @@
+# Кэш Python
+__pycache__/
+*.py[cod]
+
+# Состояние прогонов: суточный счётчик, кэш ИНН, lock-файл
+dadata_state.json
+*_state.json
+*.lock
+
+# Результаты прогонов (входной inn.xlsx и выходные отчёты)
+inn_okved*.xlsx
+*_dryrun.xlsx
