@@ -14,6 +14,7 @@
   9. Смена суток сбрасывает счётчик, но сохраняет кэш.
  10. Токен читается из .env рядом со скриптом; переменная окружения имеет приоритет,
      а сам токен не попадает в state-файл.
+ 11. Заявленная в логе скорость не превышает настроенный лимит rpm.
 
 Запуск: python3 -m unittest discover -s tests -v
 """
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -266,6 +268,38 @@ class ReviewFixesTest(unittest.TestCase):
                                            capture_output=True, text=True, timeout=60)
             self.assertEqual(without_token.returncode, 1)
             self.assertIn("Не задан токен", without_token.stdout + without_token.stderr)
+
+
+    # ---------- 10. отчёт о скорости ----------
+
+    def test_reported_speed_does_not_exceed_limit(self) -> None:
+        """
+        Скорость в строке прогресса считается по фактическим интервалам между
+        запросами. Формула «запросов / время от старта» завышала результат:
+        3 запроса за ~4 с выдавали 43 rpm при лимите 30 rpm.
+        """
+        with tempfile.TemporaryDirectory() as tmp, MockDaData() as mock:
+            tmp_path = Path(tmp)
+            inp = make_input(
+                tmp_path / "in.xlsx",
+                [("A", "7707083893"), ("B", "7707083894"), ("C", "7707083895")],
+            )
+            result = run_cli(
+                self._base_args(tmp_path, inp, ["--max-per-minute", "30", "--limit", "3"]),
+                mock.url,
+                tmp_path,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = [ln for ln in result.stdout.splitlines() if "средняя скорость" in ln]
+            self.assertTrue(lines, "строка прогресса не найдена")
+            found = re.findall(r"средняя скорость: ([0-9.]+) rpm", lines[-1])
+            self.assertTrue(found, f"скорость не распознана: {lines[-1]}")
+            rpm = float(found[0])
+            self.assertLessEqual(
+                rpm, 30.0 + 1e-6,
+                f"заявленная скорость выше лимита 30 rpm: {lines[-1]}",
+            )
+            self.assertGreater(rpm, 0.0, "скорость не измерена")
 
 
 if __name__ == "__main__":

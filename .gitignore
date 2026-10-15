@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 
+# Каталог IDE (PyCharm/IntelliJ)
+.idea/
+
 # Секреты: реальный токен DaData живёт только в .env, в git он не попадает
 .env
 .env.*

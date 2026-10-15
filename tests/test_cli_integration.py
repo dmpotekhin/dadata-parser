@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -43,7 +44,14 @@ def make_input(path: Path, rows: list[tuple[str, str]]) -> Path:
 
 
 def run_cli(args: list[str], api_url: str | None, cwd: Path, timeout: int = 240,
-            with_token: bool = True) -> subprocess.CompletedProcess:
+            with_token: bool = True, script: Path | None = None) -> subprocess.CompletedProcess:
+    """
+    Запускает CLI отдельным процессом.
+
+    `script` нужен для тестов, которым важна изоляция от `.env` проекта: dotenv
+    ищет файл от каталога самого скрипта, поэтому копию скрипта кладут во временный
+    каталог и запускают её оттуда.
+    """
     env = dict(os.environ)
     if with_token:
         env["DADATA_TOKEN"] = TEST_TOKEN
@@ -52,7 +60,7 @@ def run_cli(args: list[str], api_url: str | None, cwd: Path, timeout: int = 240,
     if api_url:
         env["DADATA_API_URL"] = api_url
     return subprocess.run(
-        [sys.executable, str(SCRIPT), *args],
+        [sys.executable, str(script or SCRIPT), *args],
         cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout,
     )
 
@@ -351,11 +359,18 @@ class CliErrorHandlingTest(unittest.TestCase):
     """Токен, маскировка и сетевые ошибки."""
 
     def test_missing_token_gives_clear_error(self) -> None:
+        """
+        Рядом со скриптом нет .env, а в окружении нет DADATA_TOKEN — ждём понятную
+        ошибку. Скрипт копируется в tmp: у реального проекта рядом лежит работающий
+        .env, который dotenv нашёл бы и тест перестал бы проверять свою сцену.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
+            local_script = tmp_path / SCRIPT.name
+            shutil.copy(SCRIPT, local_script)
             inp = make_input(tmp_path / "in.xlsx", [("Тест", "7707083893")])
             result = run_cli(["--input", str(inp), "--output", str(tmp_path / "o.xlsx")],
-                             None, tmp_path, with_token=False)
+                             None, tmp_path, with_token=False, script=local_script)
             self.assertEqual(result.returncode, 1)
             self.assertIn("Не задан токен DaData", result.stdout + result.stderr)
             self.assertIn("DADATA_TOKEN", result.stdout + result.stderr)

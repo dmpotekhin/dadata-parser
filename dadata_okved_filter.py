@@ -616,6 +616,20 @@ class DaDataRateLimiter:
             self.window.popleft()
         return len(self.window)
 
+    def pacing_span(self) -> tuple[int, float]:
+        """
+        Сколько запросов в скользящем окне и какова его протяжённость по времени.
+
+        Нужно для честной оценки скорости. Считать от старта процесса нельзя:
+        первый запрос уходит сразу, поэтому «n / (сейчас - старт)» завышает
+        результат (3 запроса за 4 с дают 45 rpm), хотя фактический интервал
+        между ними — 2 с, то есть ровно 30 rpm.
+        """
+        count = self.requests_in_window()
+        if count < 2 or not self.window:
+            return count, 0.0
+        return count, max(0.0, self.window[-1] - self.window[0])
+
     def seconds_until_slot(self) -> float:
         """
         Сколько секунд ждать до следующего запроса: учитывает и переполнение окна
@@ -1501,16 +1515,19 @@ def _log_progress(
 ) -> None:
     """Печатает строку прогресса: сколько сделано, сколько запросов ушло, ETA и совпадения."""
     elapsed = max(1e-6, time.monotonic() - started)
-    rpm = requests_run / elapsed * 60.0
+    paced, span = limiter.pacing_span()
+    rpm = (paced - 1) / span * 60.0 if paced > 1 and span > 0 else 0.0
+    speed_text = f"{rpm:.1f} rpm" if rpm > 0 else "н/д (мало запросов)"
+    rate = rpm / 60.0 if rpm > 0 else (requests_run / elapsed if requests_run else 0.0)
     remaining = max(0, total_to_process - rows_processed)
-    eta = remaining / (requests_run / elapsed) if requests_run else float("inf")
+    eta = remaining / rate if rate > 0 else float("inf")
     LOG.info(
         "[прогресс] %d/%d строк | запросов в запуске: %d (обращений с повторами: %d) | "
-        "за сутки: %d/%d | в окне 60 с: %d/%d | средняя скорость: %.1f rpm | "
+        "за сутки: %d/%d | в окне 60 с: %d/%d | средняя скорость: %s | "
         "найдено: %d | ошибок: %d | совпадений %s: %d | ETA: %s",
         rows_processed, total_to_process, requests_run, attempts_run, used_today, daily_limit,
         limiter.requests_in_window(), limiter.max_per_minute,
-        rpm, counters.found, counters.errors, "/".join(prefixes), counters.match_any,
+        speed_text, counters.found, counters.errors, "/".join(prefixes), counters.match_any,
         human_duration(eta),
     )
 
