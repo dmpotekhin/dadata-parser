@@ -107,7 +107,7 @@ class ReviewFixesTest(unittest.TestCase):
             reloaded = StateStore.load(path, "2026-10-16", resume=True)
             self.assertEqual(reloaded.used_today, 0, "новый день — счётчик обнуляется")
             self.assertEqual(reloaded.date, "2026-10-16")
-            self.assertIn("7707083893", reloaded.cache, "кэш на новый день сохраняется")
+            self.assertIn("inn:7707083893", reloaded.cache, "кэш на новый день сохраняется")
 
     # ---------- 2. блокировка состояния ----------
 
@@ -172,8 +172,8 @@ class ReviewFixesTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
             sheet = read_sheets(tmp_path / "o.xlsx")["Все"]
-            self.assertIn("ИНН (нормализованный)", sheet.columns)
-            self.assertEqual(str(sheet["ИНН (нормализованный)"].iloc[0]), "7707083893")
+            self.assertIn("Нормализованный ИНН", sheet.columns)
+            self.assertEqual(str(sheet["Нормализованный ИНН"].iloc[0]), "7707083893")
             self.assertEqual(str(sheet["ИНН"].iloc[0]), " 7707-083893 ", "исходный ИНН не портим")
             self.assertEqual(str(sheet["Статус"].iloc[0]), "ok")
 
@@ -187,7 +187,7 @@ class ReviewFixesTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(mock.snapshot()["total"], 0, "не-ASCII цифры не должны тратить запрос")
             sheet = read_sheets(tmp_path / "o.xlsx")["Все"]
-            self.assertEqual(str(sheet["Статус"].iloc[0]), "invalid_inn")
+            self.assertEqual(str(sheet["Статус"].iloc[0]), "invalid_id")
 
     # ---------- 7. запрет http на внешний хост ----------
 

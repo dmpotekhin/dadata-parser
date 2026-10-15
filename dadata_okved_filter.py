@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-dadata_okved_filter.py — выгрузка данных об организациях из DaData по списку ИНН
-и фильтрация по префиксам ОКВЭД (по умолчанию "56" и "46").
+dadata_okved_filter.py — выгрузка данных об организациях из DaData по списку
+ИНН и/или ОГРН и фильтрация по префиксам ОКВЭД (по умолчанию "56" и "46").
 
 Что делает скрипт:
- 1. Читает Excel-файл (лист --sheet, колонка --column, по умолчанию первый лист
-    и колонка "ИНН").
- 2. Нормализует ИНН, локально проверяет длину (10 или 12 цифр). Невалидные и
-    пустые ИНН запросов к DaData НЕ тратят.
+ 1. Читает Excel-файл (лист --sheet). Колонки с ИНН и ОГРН/ОГРНИП находятся
+    автоматически (--search-by auto), либо задаются явно: --inn-column,
+    --ogrn-column (устаревший синоним --column = --inn-column).
+ 2. Выбирает идентификатор для каждой строки: сначала ИНН (10/12 цифр), затем
+    ОГРН (13) / ОГРНИП (15); при --prefer ogrn порядок обратный. Если валидных
+    идентификаторов нет, строка получает статус invalid_id и запрос не уходит.
+    Локальные проверки лимиты DaData НЕ расходуют.
  3. Последовательно (по одному запросу, без потоков и асинхронщины) запрашивает
     POST https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party
  4. Строго соблюдает лимиты DaData:
@@ -19,22 +22,31 @@ dadata_okved_filter.py — выгрузка данных об организац
     в окне, и в суточном счётчике.
  5. Извлекает основной и дополнительные ОКВЭД, считает признаки совпадения
     по префиксам (56/46) и оставляет подходящие организации.
- 6. Пишет результат в Excel (листы "Все", "Отфильтровано", "Статистика"),
-    ведёт state-файл (checkpoint) и умеет продолжать работу после прерывания.
+ 6. Пишет результат в Excel (листы "Все", "Отфильтровано", "Статистика"): использованный
+    тип поиска, причина выбора идентификатора, найденные ИНН/ОГРН/ОГРНИП/КПП, название,
+    ОКВЭД, статус, признак использования фолбэка. Ведёт state-файл (checkpoint) с ключами
+    inn:/ogrn:/ogrnip: и умеет продолжать работу после прерывания.
 
 Примеры запуска:
 
     # Linux/macOS
     export DADATA_TOKEN="ваш_токен"
-    python3 dadata_okved_filter.py --input список_инн.xlsx --output результат.xlsx --column ИНН
+    python3 dadata_okved_filter.py --input список.xlsx --output результат.xlsx --search-by auto --prefer inn
 
     # Windows cmd
     set DADATA_TOKEN=ваш_токен
-    python dadata_okved_filter.py --input список_инн.xlsx --output результат.xlsx --column ИНН
+    python dadata_okved_filter.py --input список.xlsx --output результат.xlsx --search-by auto --prefer inn
 
     # Windows PowerShell
     $env:DADATA_TOKEN="ваш_токен"
-    python dadata_okved_filter.py --input список_инн.xlsx --output результат.xlsx --column ИНН
+    python dadata_okved_filter.py --input список.xlsx --output результат.xlsx --search-by auto --prefer inn
+
+    # приоритет ОГРН; фолбэк на ОГРН, если поиск по ИНН не дал результата
+    python3 dadata_okved_filter.py --input список.xlsx --output результат.xlsx --prefer ogrn
+    python3 dadata_okved_filter.py --input список.xlsx --output результат.xlsx --prefer inn --fallback-to-ogrn
+
+    # явные колонки
+    python3 dadata_okved_filter.py --input список.xlsx --output результат.xlsx --inn-column "ИНН компании" --ogrn-column "ОГРН"
 
     # тестовый прогон на 100 строках
     python3 dadata_okved_filter.py --input список_инн.xlsx --output результат_test.xlsx --limit 100
@@ -60,10 +72,11 @@ import re
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -103,19 +116,58 @@ RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 # ИНН российских организаций: 10 цифр (юрлицо) или 12 (ИП/физлицо).
 # Именно ASCII-цифры: str.isdigit() пропускает арабско-индийские и надстрочные цифры.
 INN_RE = re.compile(r"[0-9]{10}(?:[0-9]{2})?")
-# Мусор, который убираем из ИНН: пробелы (в т.ч. NBSP), дефисы (ASCII и типографские)
+# Мусор, который убираем из идентификаторов: пробелы (в т.ч. NBSP), дефисы (ASCII и типографские)
 INN_JUNK_RE = re.compile(r"[\s\u00a0\u2010-\u2015\u2212-]")
+
+# ОГРН юрлица — 13 цифр, ОГРНИП индивидуального предпринимателя — 15 цифр.
+OGRN_RE = re.compile(r"[0-9]{13}")
+OGRNIP_RE = re.compile(r"[0-9]{15}")
+
+# Типы идентификаторов: используются в колонке «Использованный тип поиска»
+# и как префикс ключа кэша (inn:…, ogrn:…, ogrnip:…).
+KIND_INN = "inn"
+KIND_OGRN = "ogrn"
+KIND_OGRNIP = "ogrnip"
+KINDS = (KIND_INN, KIND_OGRN, KIND_OGRNIP)
+
+# Режим поиска и приоритет идентификатора
+SEARCH_BY_AUTO = "auto"
+PREFER_INN = "inn"
+PREFER_OGRN = "ogrn"
+
+# Статусы, после которых при --fallback-to-ogrn имеет смысл пробовать ОГРН
+FALLBACK_STATUSES = ("not_found", "error")
+
+# Причины выбора идентификатора (попадают в отчёт как есть)
+REASON_INN_OK = "INN найден и валиден"
+REASON_INN_EMPTY_OGRN = "INN пустой, использован ОГРН"
+REASON_INN_INVALID_OGRN = "INN невалидный, использован ОГРН"
+REASON_INN_FALLBACK_OGRN = "INN not_found, fallback на ОГРН"
+REASON_INN_ERROR_FALLBACK_OGRN = "INN error, fallback на ОГРН"
+REASON_OGRN_OK = "ОГРН найден и валиден (приоритет ОГРН)"
+REASON_OGRN_EMPTY_INN = "ОГРН пустой, использован ИНН"
+REASON_OGRN_INVALID_INN = "ОГРН невалидный, использован ИНН"
+REASON_BOTH_MISSING = "Оба идентификатора пусты"
+REASON_BOTH_INVALID = "Оба идентификатора невалидны"
+REASON_INN_EMPTY_OGRN_INVALID = "INN пустой, ОГРН невалидный"
+REASON_INN_INVALID_OGRN_EMPTY = "INN невалидный, ОГРН пустой"
+REASON_ID_KIND_INN = "Идентификатор распознан как ИНН"
+REASON_ID_KIND_OGRN = "Идентификатор распознан как ОГРН"
+REASON_ID_KIND_OGRNIP = "Идентификатор распознан как ОГРНИП"
+REASON_ID_UNRECOGNIZED = "Идентификатор не распознан"
 
 # Статусы обработки строки
 ST_OK = "ok"
 ST_NOT_FOUND = "not_found"
-ST_INVALID_INN = "invalid_inn"
-ST_EMPTY_INN = "empty_inn"
+ST_INVALID_ID = "invalid_id"
 ST_ERROR = "error"
 ST_AUTH_ERROR = "auth_error"
 ST_QUOTA_EXCEEDED = "quota_exceeded"
 ST_PENDING = "pending"
 ST_DRY_RUN = "dry_run"
+
+# Версия формата state-файла: 2 — ключи кэша с типом идентификатора (inn:/ogrn:/ogrnip:)
+STATE_VERSION = 2
 
 # Статусы, результат которых можно кэшировать между запусками.
 # Ошибки сети/HTTP НЕ кэшируются: при следующем запуске строка запрашивается снова.
@@ -123,21 +175,47 @@ CACHEABLE_STATUSES = frozenset({ST_OK, ST_NOT_FOUND})
 
 # Колонки входного и выходного файла
 COL_INN = "ИНН"
-COL_INN_NORM = "ИНН (нормализованный)"
+COL_OGRN = "ОГРН"
+COL_OGRNIP = "ОГРНИП"
+COL_INN_RAW = "ИНН из строки"
+COL_OGRN_RAW = "ОГРН из строки"
+COL_INN_NORM = "Нормализованный ИНН"
+COL_OGRN_NORM = "Нормализованный ОГРН"
+COL_SEARCH_KIND = "Использованный тип поиска"
+COL_REASON = "Причина выбора идентификатора"
+COL_FOUND_INN = "Найденный ИНН"
+COL_FOUND_OGRN = "Найденный ОГРН"
+COL_FOUND_OGRNIP = "Найденный ОГРНИП"
+COL_FOUND_KPP = "Найденный КПП"
 COL_NAME = "Название"
-COL_OKVED_MAIN = "ОКВЭД основной"
-COL_OKVED_EXTRA = "ОКВЭД дополнительные"
+COL_OKVED_MAIN = "Основной ОКВЭД"
+COL_OKVED_EXTRA = "Дополнительные ОКВЭД"
 COL_MATCH_MAIN = "Совпадает основной"
 COL_MATCH_ANY = "Совпадает любой"
 COL_STATUS = "Статус"
 COL_ERROR = "Ошибка"
+COL_FALLBACK = "Fallback использован"
+COL_CACHE_KEY = "Ключ запроса"
 COL_USED = "Использовано запросов"
 COL_DATE = "Дата обработки"
 
+# Имена колонок из прежних версий отчёта: нужны только для чтения старых файлов.
+COL_INN_NORM_LEGACY = "ИНН (нормализованный)"
+COL_OKVED_MAIN_LEGACY = "ОКВЭД основной"
+COL_OKVED_EXTRA_LEGACY = "ОКВЭД дополнительные"
+
 NEW_COLUMNS = [
-    COL_INN_NORM, COL_NAME, COL_OKVED_MAIN, COL_OKVED_EXTRA,
-    COL_MATCH_MAIN, COL_MATCH_ANY, COL_STATUS, COL_ERROR, COL_USED, COL_DATE,
+    COL_SEARCH_KIND, COL_REASON, COL_INN_RAW, COL_OGRN_RAW, COL_INN_NORM, COL_OGRN_NORM,
+    COL_FOUND_INN, COL_FOUND_OGRN, COL_FOUND_OGRNIP, COL_FOUND_KPP,
+    COL_NAME, COL_OKVED_MAIN, COL_OKVED_EXTRA, COL_STATUS, COL_ERROR, COL_FALLBACK,
+    COL_CACHE_KEY, COL_MATCH_MAIN, COL_MATCH_ANY, COL_USED, COL_DATE,
 ]
+
+# Автопоиск колонок с идентификаторами (порядок из ТЗ важен)
+AUTO_ID_COLUMNS = ("ИНН", "ОГРН", "ОГРНИП", "Идентификатор", "Код")
+# Слабые кандидаты: берутся только при точном совпадении имени колонки,
+# иначе «Идентификатор СПАРК» ушёл бы в DaData как идентификатор организации.
+WEAK_ID_COLUMNS = ("Идентификатор", "Код")
 
 SHEET_ALL = "Все"
 SHEET_FILTERED = "Отфильтровано"
@@ -241,15 +319,15 @@ def iso_now(tz: tzinfo) -> str:
     return now_local(tz).isoformat(timespec="seconds")
 
 
-def normalize_inn(raw: Any) -> str:
+def _normalize_digits(raw: Any) -> str:
     """
-    Приводит значение из Excel к строковому ИНН: убирает пробелы и дефисы,
+    Приводит значение из Excel к строке цифр: убирает пробелы и дефисы,
     обрабатывает числа, float-значения вида 543321094661.0, NaN/None.
     Пустое значение возвращается как "" (запрос к API не выполняется).
     """
     if raw is None:
         return ""
-    if isinstance(raw, bool):  # bool — не ИНН
+    if isinstance(raw, bool):  # bool — не идентификатор
         return ""
     try:
         if pd.isna(raw):
@@ -262,9 +340,245 @@ def normalize_inn(raw: Any) -> str:
     return INN_JUNK_RE.sub("", text)
 
 
+def normalize_inn(raw: Any) -> str:
+    """Нормализованный ИНН: только цифры, пусто если значения нет."""
+    return _normalize_digits(raw)
+
+
+def normalize_ogrn(raw: Any) -> str:
+    """Нормализованный ОГРН/ОГРНИП: только цифры, пусто если значения нет."""
+    return _normalize_digits(raw)
+
+
+def cell_to_text(raw: Any) -> str:
+    """Значение ячейки как есть (для колонок «… из строки»), без обрезки цифр."""
+    if raw is None:
+        return ""
+    try:
+        if pd.isna(raw):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(raw).strip()
+
+
 def is_valid_inn(inn: str) -> bool:
     """ИНН валиден, если это ровно 10 или 12 ASCII-цифр."""
     return bool(INN_RE.fullmatch(inn))
+
+
+def is_valid_ogrn(ogrn: str) -> bool:
+    """ОГРН юрлица валиден, если это ровно 13 ASCII-цифр."""
+    return bool(OGRN_RE.fullmatch(ogrn))
+
+
+def is_valid_ogrnip(ogrnip: str) -> bool:
+    """ОГРНИП валиден, если это ровно 15 ASCII-цифр."""
+    return bool(OGRNIP_RE.fullmatch(ogrnip))
+
+
+def ogrn_kind(value: str) -> str:
+    """Тип идентификатора по длине значения: 'ogrn' (13 цифр), 'ogrnip' (15) или ''."""
+    if is_valid_ogrn(value):
+        return KIND_OGRN
+    if is_valid_ogrnip(value):
+        return KIND_OGRNIP
+    return ""
+
+
+def cache_key(kind: str, value: str) -> str:
+    """Ключ кэша: 'inn:7707083893', 'ogrn:1027700000000', 'ogrnip:304770000012345'."""
+    if not kind or not value:
+        return ""
+    return f"{kind}:{value}"
+
+
+def migrate_cache_key(key: Any) -> str:
+    """
+    Ключи прежних версий (голый ИНН без префикса) приводится к 'inn:…'.
+    Ключи с префиксом возвращаются как есть — миграция идемпотентна.
+    """
+    text = str(key).strip()
+    if not text or ":" in text:
+        return text
+    if is_valid_inn(text):
+        return cache_key(KIND_INN, text)
+    kind = ogrn_kind(text)
+    return cache_key(kind, text) if kind else text
+
+
+def key_value(key: str) -> tuple[str, str]:
+    """'inn:7707083893' -> ('inn', '7707083893'); ключ без префикса -> ('', ключ)."""
+    kind, sep, value = str(key).partition(":")
+    if sep and value:
+        return kind, value
+    return "", str(key)
+
+
+def _dedupe_keys(keys: Sequence[Any]) -> list[str]:
+    """Список ключей без дублей с сохранением порядка (миграция может их породить)."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for key in keys:
+        text = str(key)
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def split_ogrn_fields(data: dict[str, Any]) -> dict[str, str]:
+    """
+    Разбирает реквизиты найденной организации: ИНН, КПП, ОГРН и ОГРНИП.
+
+    DaData отдаёт и ОГРН юрлица, и ОГРНИП ИП в одном поле data.ogrn (отдельного
+    поля ogrnip в ответе нет — проверено запросом по ОГРНИП 326547600194488),
+    поэтому тип определяется по длине значения: 13 цифр — ОГРН, 15 — ОГРНИП.
+    Поле data.type (LEGAL/INDIVIDUAL) используется как подсказка.
+    """
+    inn = str(data.get("inn") or "").strip()
+    kpp = str(data.get("kpp") or "").strip()
+    ogrn_value = str(data.get("ogrn") or "").strip()
+    ogrnip_direct = str(data.get("ogrnip") or "").strip()
+    party_type = str(data.get("type") or "").strip().upper()
+
+    found_ogrn = ""
+    found_ogrnip = ogrnip_direct
+    if ogrn_value:
+        if is_valid_ogrnip(ogrn_value) or (party_type == "INDIVIDUAL" and not is_valid_ogrn(ogrn_value)):
+            found_ogrnip = found_ogrnip or ogrn_value
+        else:
+            # 13 цифр или неизвестный формат — не теряем значение, пишем в ОГРН
+            found_ogrn = ogrn_value
+    return {
+        "found_inn": inn,
+        "found_ogrn": found_ogrn,
+        "found_ogrnip": found_ogrnip,
+        "found_kpp": kpp,
+    }
+
+
+@dataclass
+class RowIdentifier:
+    """Каким идентификатором и почему ищем организацию по конкретной строке."""
+
+    inn_raw: str = ""
+    inn_norm: str = ""
+    ogrn_raw: str = ""
+    ogrn_norm: str = ""
+    kind: str = ""
+    value: str = ""
+    reason: str = ""
+    fallback_kind: str = ""
+    fallback_value: str = ""
+
+    @property
+    def has_valid_inn(self) -> bool:
+        return is_valid_inn(self.inn_norm)
+
+    @property
+    def has_valid_ogrn(self) -> bool:
+        return bool(ogrn_kind(self.ogrn_norm))
+
+    @property
+    def key(self) -> str:
+        """Ключ кэша по фактически выбранному идентификатору."""
+        return cache_key(self.kind, self.value)
+
+    @property
+    def fallback_key(self) -> str:
+        """Ключ кэша для ОГРН, который можно использовать при fallback."""
+        return cache_key(self.fallback_kind, self.fallback_value)
+
+
+def _missing_reason(inn_norm: str, ogrn_norm: str) -> str:
+    """Причина, когда ни ИНН, ни ОГРН не годятся для запроса."""
+    if not inn_norm and not ogrn_norm:
+        return REASON_BOTH_MISSING
+    if not inn_norm:
+        return REASON_INN_EMPTY_OGRN_INVALID
+    if not ogrn_norm:
+        return REASON_INN_INVALID_OGRN_EMPTY
+    return REASON_BOTH_INVALID
+
+
+def choose_identifier(inn_norm: str, ogrn_norm: str, prefer: str = PREFER_INN) -> RowIdentifier:
+    """
+    Выбирает идентификатор для запроса к DaData.
+
+    prefer=inn  — сначала ИНН; ОГРН берётся, только если ИНН пустой или невалидный.
+    prefer=ogrn — сначала ОГРН; ИНН берётся, только если ОГРН пустой или невалидный.
+
+    Флаг --fallback-to-ogrn здесь не учитывается: валидный ОГРН всегда кладётся
+    в fallback_*, а решает, использовать ли его, уже основной цикл обработки.
+    """
+    ident = RowIdentifier(inn_norm=inn_norm, ogrn_norm=ogrn_norm)
+    ident.fallback_kind = ogrn_kind(ogrn_norm)
+    ident.fallback_value = ogrn_norm if ident.fallback_kind else ""
+
+    inn_ok = is_valid_inn(inn_norm)
+    ogrn_ok = ogrn_kind(ogrn_norm)
+
+    if prefer == PREFER_OGRN:
+        if ogrn_ok:
+            ident.kind, ident.value, ident.reason = ogrn_ok, ogrn_norm, REASON_OGRN_OK
+            return ident
+        if inn_ok:
+            ident.kind, ident.value = KIND_INN, inn_norm
+            ident.reason = REASON_OGRN_EMPTY_INN if not ogrn_norm else REASON_OGRN_INVALID_INN
+            return ident
+        ident.reason = _missing_reason(inn_norm, ogrn_norm)
+        return ident
+
+    if inn_ok:
+        ident.kind, ident.value, ident.reason = KIND_INN, inn_norm, REASON_INN_OK
+        return ident
+    if ogrn_ok:
+        ident.kind, ident.value = ogrn_ok, ogrn_norm
+        ident.reason = REASON_INN_EMPTY_OGRN if not inn_norm else REASON_INN_INVALID_OGRN
+        return ident
+    ident.reason = _missing_reason(inn_norm, ogrn_norm)
+    return ident
+
+
+def choose_from_weak_column(value: str) -> RowIdentifier:
+    """
+    Строка из колонки «Идентификатор»/«Код»: тип определяется по длине значения
+    (10/12 цифр — ИНН, 13 — ОГРН, 15 — ОГРНИП), иначе идентификатор не распознан.
+    """
+    ident = RowIdentifier()
+    kind = KIND_INN if is_valid_inn(value) else ogrn_kind(value)
+    if not kind:
+        ident.reason = REASON_ID_UNRECOGNIZED
+        return ident
+    ident.kind, ident.value = kind, value
+    if kind == KIND_INN:
+        ident.inn_raw = ident.inn_norm = value
+        ident.reason = REASON_ID_KIND_INN
+    else:
+        ident.ogrn_raw = ident.ogrn_norm = value
+        ident.fallback_kind, ident.fallback_value = kind, value
+        ident.reason = REASON_ID_KIND_OGRN if kind == KIND_OGRN else REASON_ID_KIND_OGRNIP
+    return ident
+
+
+REQUISITE_FIELD_BY_KIND = {KIND_INN: "found_inn", KIND_OGRN: "found_ogrn", KIND_OGRNIP: "found_ogrnip"}
+
+
+def enrich_found_from_key(record: dict[str, Any], key: str) -> dict[str, Any]:
+    """
+    Дополняет запись из старого кэша реквизитами, которые тогда не сохраняли.
+
+    Значение берётся из ключа (inn:/ogrn:/ogrnip:): при успешном поиске DaData
+    возвращает ровно тот идентификатор, по которому организация найдена.
+    """
+    if record.get("status") != ST_OK:
+        return record
+    kind, value = key_value(key)
+    field = REQUISITE_FIELD_BY_KIND.get(kind)
+    if field and value and not record.get(field):
+        record[field] = value
+    return record
 
 
 def parse_prefixes(raw: str) -> tuple[str, ...]:
@@ -475,13 +789,24 @@ class StateStore:
         if resume:
             processed = raw.get("processed_inns")
             if isinstance(processed, list):
-                store.processed = [str(item) for item in processed]
+                # Ключи прежних версий (голый ИНН) мигрируем к 'inn:…'.
+                store.processed = _dedupe_keys([migrate_cache_key(item) for item in processed])
                 store._processed_set = set(store.processed)
             cache = raw.get("cache")
             if isinstance(cache, dict):
-                store.cache = {
-                    str(inn): record for inn, record in cache.items() if isinstance(record, dict)
-                }
+                store.cache = {}
+                legacy_keys = False
+                for key, record in cache.items():
+                    if not isinstance(record, dict):
+                        continue
+                    migrated_key = migrate_cache_key(key)
+                    legacy_keys = legacy_keys or migrated_key != str(key)
+                    store.cache[migrated_key] = record
+                if legacy_keys:
+                    LOG.info(
+                        "Ключи кэша состояния перенесены в формат с типом идентификатора "
+                        "(inn:/ogrn:/ogrnip:)."
+                    )
         else:
             store.processed = []
             store.cache = {}
@@ -506,6 +831,7 @@ class StateStore:
         продолжать работу, не учитывая расход, опаснее, чем остановиться.
         """
         payload = {
+            "version": STATE_VERSION,
             "date": self.date,
             "used_today": self.used_today,
             "processed_inns": self.processed,
@@ -532,16 +858,16 @@ class StateStore:
 
     # ---------- операции ----------
 
-    def mark_processed(self, inn: str) -> None:
-        """Помечает ИНН как обработанный (без дублей)."""
-        if inn not in self._processed_set:
-            self._processed_set.add(inn)
-            self.processed.append(inn)
+    def mark_processed(self, key: str) -> None:
+        """Помечает ключ идентификатора ('inn:…'/'ogrn:…') обработанным, без дублей."""
+        if key not in self._processed_set:
+            self._processed_set.add(key)
+            self.processed.append(key)
 
-    def put_cache(self, inn: str, record: dict[str, Any]) -> None:
-        """Кладёт кэшируемый результат в состояние."""
-        self.cache[inn] = record
-        self.mark_processed(inn)
+    def put_cache(self, key: str, record: dict[str, Any]) -> None:
+        """Кладёт кэшируемый результат в состояние под ключом с типом идентификатора."""
+        self.cache[key] = record
+        self.mark_processed(key)
 
     def bump_requests(self, count: int = 1) -> None:
         """Увеличивает дневной счётчик запросов."""
@@ -747,9 +1073,21 @@ class DaDataClient:
             "Accept": "application/json",
         }
 
-    def fetch_party(self, inn: str) -> dict[str, Any]:
+    def fetch_party(self, query: str, kind: str = KIND_INN) -> dict[str, Any]:
         """
-        Запрашивает организацию по ИНН.
+        Запрашивает организацию по идентификатору и помечает запись типом поиска.
+
+        query — ИНН (10 или 12 цифр), ОГРН юрлица (13) или ОГРНИП (15);
+        kind  — тип идентификатора (inn/ogrn/ogrnip): попадает в отчёт и в ключ кэша.
+        """
+        record = self._request_party(query)
+        record["search_kind"] = kind
+        record["cache_key"] = cache_key(kind, query)
+        return record
+
+    def _request_party(self, query: str) -> dict[str, Any]:
+        """
+        Отправляет запрос к findById/party (повторы, лимиты, разбор ответа).
 
         Возвращает запись результата. Исключения:
           - DailyLimitReached  — исчерпан локальный дневной лимит;
@@ -757,7 +1095,7 @@ class DaDataClient:
           - DaDataQuotaError   — HTTP 402/403 с признаками лимита на стороне DaData.
         Остальные проблемы (сеть, битый JSON, 4xx/5xx) записываются в поле error.
         """
-        payload = {"query": inn, "count": 1}
+        payload = {"query": query, "count": 1}
         last_error = ""
         attempt = 0
         while attempt < self.max_retries:
@@ -780,7 +1118,7 @@ class DaDataClient:
 
             status = response.status_code
             if status == 200:
-                return self._parse_success(response, inn)
+                return self._parse_success(response)
             if status == 402:
                 raise DaDataQuotaError(f"HTTP 402: {(response.text or '')[:300]}")
             if status == 403:
@@ -851,7 +1189,7 @@ class DaDataClient:
         if delay > 0:
             self._sleep(delay)
 
-    def _parse_success(self, response: requests.Response, inn: str) -> dict[str, Any]:
+    def _parse_success(self, response: requests.Response) -> dict[str, Any]:
         """Устойчивый разбор успешного ответа DaData."""
         try:
             payload = response.json()
@@ -889,6 +1227,7 @@ class DaDataClient:
         record["name"] = str(name).strip()
         record["okved_main"] = main_okved
         record["okved_extra"] = extras
+        record.update(split_ogrn_fields(data))
         return record
 
     @staticmethod
@@ -901,6 +1240,16 @@ class DaDataClient:
             "error": "",
             "used": None,
             "date": None,
+            # найденные реквизиты организации (по данным DaData, не из строки файла)
+            "found_inn": "",
+            "found_ogrn": "",
+            "found_ogrnip": "",
+            "found_kpp": "",
+            # служебное: тип фактического поиска и ключ кэша
+            "search_kind": "",
+            "cache_key": "",
+            "fallback": False,
+            "reason": "",
         }
 
     def _error_record(self, kind: str, message: str, attempts: int = 1) -> dict[str, Any]:
@@ -930,11 +1279,14 @@ class MatchCounters:
         self.found = 0
         self.not_found = 0
         self.errors = 0
+        self.invalid_id = 0
+        self.fallbacks = 0
+        self.by_kind: dict[str, int] = {kind: 0 for kind in KINDS}
         self.match_main = 0
         self.match_any = 0
 
     def add(self, record: Optional[dict[str, Any]]) -> None:
-        """Учитывает одну запись результата."""
+        """Учитывает одну запись результата: статус, тип поиска, фолбэк, совпадения."""
         if not record:
             return
         status = record.get("status")
@@ -942,8 +1294,15 @@ class MatchCounters:
             self.found += 1
         elif status == ST_NOT_FOUND:
             self.not_found += 1
+        elif status == ST_INVALID_ID:
+            self.invalid_id += 1
         elif status == ST_ERROR:
             self.errors += 1
+        if record.get("fallback"):
+            self.fallbacks += 1
+        kind = record.get("search_kind") or ""
+        if kind in self.by_kind:
+            self.by_kind[kind] += 1
         main = record.get("okved_main") or ""
         extras = record.get("okved_extra") or []
         if okved_matches(main, self.prefixes):
@@ -958,12 +1317,153 @@ class MatchCounters:
 # --------------------------------------------------------------------------------------
 
 
-def read_input(path: Path, sheet: Optional[str], column: str) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Читает Excel и возвращает (датафрейм, список нормализованных ИНН).
+@dataclass
+class IdColumns:
+    """Колонки, из которых берутся идентификаторы строк."""
 
-    Колонка с ИНН читается как строки (dtype=str): иначе Excel/float могут
-    испортить значение (ведущие нули, экспоненциальная запись).
+    inn: Optional[str] = None
+    ogrn: Optional[str] = None
+    weak: Optional[str] = None  # «Идентификатор»/«Код»: тип определяется по значению
+    source: str = "автопоиск"
+
+    def describe(self) -> str:
+        """Описание выбранных колонок для лога и листа «Статистика»."""
+        parts = [f"{COL_INN}: {self.inn or '—'}", f"{COL_OGRN}: {self.ogrn or '—'}"]
+        if self.weak:
+            parts.append(f"общий идентификатор: {self.weak}")
+        return f"{'; '.join(parts)} ({self.source})"
+
+
+def _header_key(name: Any) -> str:
+    """Нормализованное имя колонки для сопоставления: «ё» → «е», верхний регистр."""
+    return str(name).strip().upper().replace("Ё", "Е")
+
+
+def cell_to_text(value: Any) -> str:
+    """Значение ячейки как оно есть в файле (для колонок «… из строки»)."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def _count_valid(frame: pd.DataFrame, column: str, validator: Callable[[str], Any]) -> int:
+    """Сколько значений колонки проходят проверку (для выбора лучшего кандидата)."""
+    return sum(1 for value in frame[column] if validator(_normalize_digits(value)))
+
+
+def _pick_best(
+    names: Sequence[str],
+    frame: pd.DataFrame,
+    predicate: Callable[[str], bool],
+    validator: Callable[[str], Any],
+) -> Optional[str]:
+    """
+    Лучший кандидат среди колонок, чьё имя подходит под predicate.
+
+    Лучший = больше валидных значений; при равенстве — самая левая колонка.
+    Счёт нужен, чтобы колонка вида «ИНН/КПП» не перебила настоящую колонку ИНН.
+    """
+    best: Optional[str] = None
+    best_score = -1
+    for name in names:
+        if not predicate(name):
+            continue
+        score = _count_valid(frame, name, validator)
+        if score > best_score:
+            best, best_score = name, score
+    return best
+
+
+def detect_id_columns(
+    frame: pd.DataFrame, inn_column: Optional[str], ogrn_column: Optional[str]
+) -> IdColumns:
+    """
+    Определяет колонки с ИНН и ОГРН/ОГРНИП.
+
+    Явно указанные колонки (--inn-column/--ogrn-column) берутся как есть, вторая
+    при этом доискивается автоматически. Иначе работает автопоиск в порядке
+    AUTO_ID_COLUMNS: сначала точное имя, затем «содержит» с выбором по числу
+    валидных значений. «Идентификатор»/«Код» берутся только при точном имени —
+    иначе в DaData уехал бы, например, «Идентификатор СПАРК».
+    """
+    names = [str(column) for column in frame.columns]
+    available = ", ".join(names) or "(нет колонок)"
+    for label, value in (("--inn-column", inn_column), ("--ogrn-column", ogrn_column)):
+        if value is not None and value not in names:
+            raise SystemExit(
+                f"Колонка {value!r} из {label} не найдена. Доступные колонки: {available}"
+            )
+
+    columns = IdColumns(
+        inn=inn_column,
+        ogrn=ogrn_column,
+        source="явно" if (inn_column is not None or ogrn_column is not None) else "автопоиск",
+    )
+    exact = {_header_key(name): name for name in names}
+
+    if columns.inn is None:
+        columns.inn = exact.get(_header_key(COL_INN)) or _pick_best(
+            names, frame, lambda name: "ИНН" in _header_key(name), is_valid_inn
+        )
+    if columns.ogrn is None:
+        for candidate in ("ОГРНИП", "ОГРН"):
+            found = exact.get(_header_key(candidate))
+            if found is not None and found != columns.inn:
+                columns.ogrn = found
+                break
+        if columns.ogrn is None:
+            columns.ogrn = _pick_best(
+                names,
+                frame,
+                lambda name: name != columns.inn and "ОГРН" in _header_key(name),
+                ogrn_kind,
+            )
+    if columns.inn is None and columns.ogrn is None:
+        for candidate in WEAK_ID_COLUMNS:
+            found = exact.get(_header_key(candidate))
+            if found is not None:
+                columns.weak = found
+                break
+    return columns
+
+
+def build_identifiers(frame: pd.DataFrame, columns: IdColumns, prefer: str) -> list[RowIdentifier]:
+    """Считает идентификатор для каждой строки таблицы (без обращений к API)."""
+    inn_values = frame[columns.inn] if columns.inn else None
+    ogrn_values = frame[columns.ogrn] if columns.ogrn else None
+    weak_values = frame[columns.weak] if columns.weak else None
+
+    identifiers: list[RowIdentifier] = []
+    for position in range(len(frame)):
+        inn_raw = cell_to_text(inn_values.iloc[position]) if inn_values is not None else ""
+        ogrn_raw = cell_to_text(ogrn_values.iloc[position]) if ogrn_values is not None else ""
+        if weak_values is not None:
+            ident = choose_from_weak_column(_normalize_digits(cell_to_text(weak_values.iloc[position])))
+        else:
+            ident = choose_identifier(_normalize_digits(inn_raw), _normalize_digits(ogrn_raw), prefer)
+            ident.inn_raw = inn_raw
+            ident.ogrn_raw = ogrn_raw
+        identifiers.append(ident)
+    return identifiers
+
+
+def read_input(
+    path: Path,
+    sheet: Optional[str],
+    inn_column: Optional[str] = None,
+    ogrn_column: Optional[str] = None,
+    prefer: str = PREFER_INN,
+) -> tuple[pd.DataFrame, list[RowIdentifier], IdColumns]:
+    """
+    Читает Excel и возвращает (датафрейм, идентификаторы строк, выбранные колонки).
+
+    Все колонки читаются как строки (dtype=str): иначе Excel/float могут испортить
+    идентификаторы — ведущие нули, экспоненциальная запись, «543321094661.0».
     """
     if not path.exists():
         raise SystemExit(f"Входной файл не найден: {path}")
@@ -973,18 +1473,19 @@ def read_input(path: Path, sheet: Optional[str], column: str) -> tuple[pd.DataFr
     if sheet_name not in names:
         raise SystemExit(f"Лист {sheet_name!r} не найден. Доступные листы: {', '.join(names)}")
 
-    header = pd.read_excel(path, sheet_name=sheet_name, nrows=0)
-    if column not in header.columns:
-        raise SystemExit(
-            f"Колонка {column!r} не найдена. Доступные колонки: {', '.join(map(str, header.columns))}"
-        )
+    frame = pd.read_excel(path, sheet_name=sheet_name, dtype=str)
+    if not len(frame.columns):
+        raise SystemExit(f"Лист {sheet_name!r} пуст — нечего обрабатывать.")
 
-    frame = pd.read_excel(path, sheet_name=sheet_name, dtype={column: str})
-    return frame, [normalize_inn(value) for value in frame[column]]
+    columns = detect_id_columns(frame, inn_column, ogrn_column)
+    identifiers = build_identifiers(frame, columns, prefer)
+    return frame, identifiers, columns
 
 
-def record_to_row(record: Optional[dict[str, Any]], inn: str, prefixes: tuple[str, ...]) -> dict[str, Any]:
-    """Преобразует запись результата в набор выходных колонок."""
+def record_to_row(
+    record: Optional[dict[str, Any]], ident: RowIdentifier, prefixes: tuple[str, ...]
+) -> dict[str, Any]:
+    """Преобразует запись результата и идентификатор строки в набор выходных колонок."""
     if record is None:
         record = {"status": ST_PENDING}
     status = record.get("status") or ST_PENDING
@@ -998,32 +1499,44 @@ def record_to_row(record: Optional[dict[str, Any]], inn: str, prefixes: tuple[st
     else:
         flag_main = bool(match_main)
         flag_any = bool(match_any)
-    used = record.get("used")
     return {
-        COL_INN_NORM: inn,
+        COL_SEARCH_KIND: record.get("search_kind") or ident.kind,
+        COL_REASON: record.get("reason") or ident.reason,
+        COL_INN_RAW: ident.inn_raw,
+        COL_OGRN_RAW: ident.ogrn_raw,
+        COL_INN_NORM: ident.inn_norm,
+        COL_OGRN_NORM: ident.ogrn_norm,
+        COL_FOUND_INN: record.get("found_inn") or "",
+        COL_FOUND_OGRN: record.get("found_ogrn") or "",
+        COL_FOUND_OGRNIP: record.get("found_ogrnip") or "",
+        COL_FOUND_KPP: record.get("found_kpp") or "",
         COL_NAME: record.get("name") or "",
-        COL_OKVED_MAIN: main,
-        COL_OKVED_EXTRA: "; ".join(extras),
-        COL_MATCH_MAIN: flag_main,
-        COL_MATCH_ANY: flag_any,
+        COL_OKVED_MAIN: main or None,
+        COL_OKVED_EXTRA: "; ".join(extras) or None,
         COL_STATUS: status,
         COL_ERROR: record.get("error") or "",
-        COL_USED: used,
+        COL_FALLBACK: "да" if record.get("fallback") else "нет",
+        COL_CACHE_KEY: record.get("cache_key") or ident.key,
+        COL_MATCH_MAIN: flag_main,
+        COL_MATCH_ANY: flag_any,
+        COL_USED: record.get("used"),
         COL_DATE: record.get("date") or "",
     }
 
 
 def build_results_df(
-    src_df: pd.DataFrame, inns: list[str], records: list[Optional[dict[str, Any]]], prefixes: tuple[str, ...]
+    src_df: pd.DataFrame,
+    identifiers: list[RowIdentifier],
+    records: list[Optional[dict[str, Any]]],
+    prefixes: tuple[str, ...],
 ) -> pd.DataFrame:
     """Собирает выходной датафрейм: исходные колонки + служебные."""
-    rows = [record_to_row(records[idx], inns[idx], prefixes) for idx in range(len(inns))]
+    rows = [
+        record_to_row(records[idx], identifiers[idx], prefixes)
+        for idx in range(len(identifiers))
+    ]
     new_columns = pd.DataFrame(rows, columns=NEW_COLUMNS)
-    result = pd.concat([src_df.reset_index(drop=True), new_columns], axis=1)
-    if COL_INN not in result.columns:
-        # В исходном файле нет колонки "ИНН" — добавляем нормализованные значения
-        result.insert(0, COL_INN, inns)
-    return result
+    return pd.concat([src_df.reset_index(drop=True), new_columns], axis=1)
 
 
 def write_output(path: Path, df_all: pd.DataFrame, df_filtered: pd.DataFrame,
@@ -1053,11 +1566,49 @@ def write_output(path: Path, df_all: pd.DataFrame, df_filtered: pd.DataFrame,
         raise OutputWriteError(f"не удалось собрать {path}: {exc}") from exc
 
 
+CACHE_KEY_RE = re.compile(r"^(?:inn|ogrn|ogrnip):[0-9]+$")
+
+
+def _restore_key(row: pd.Series) -> str:
+    """
+    Восстанавливает ключ кэша из строки отчёта.
+
+    Новый формат: служебная колонка «Ключ запроса» (inn:/ogrn:/ogrnip:) или пара
+    «Использованный тип поиска» + нормализованное значение. Прежний формат отчёта
+    (колонка «ИНН (нормализованный)» без типа) читается как inn:…
+    """
+    raw = row.get(COL_CACHE_KEY) if COL_CACHE_KEY in row.index else None
+    text = "" if raw is None or pd.isna(raw) else str(raw).strip()
+    if CACHE_KEY_RE.match(text):
+        return text
+
+    kind = str(row.get(COL_SEARCH_KIND) or "").strip() if COL_SEARCH_KIND in row.index else ""
+    if kind in KINDS:
+        column = COL_INN_NORM if kind == KIND_INN else COL_OGRN_NORM
+        if column in row.index:
+            value = _normalize_digits(row.get(column))
+            if kind == KIND_INN and is_valid_inn(value):
+                return cache_key(kind, value)
+            if kind == KIND_OGRN and is_valid_ogrn(value):
+                return cache_key(kind, value)
+            if kind == KIND_OGRNIP and is_valid_ogrnip(value):
+                return cache_key(kind, value)
+
+    for column in (COL_INN_NORM_LEGACY, COL_INN, COL_INN_NORM):
+        if column in row.index:
+            value = normalize_inn(row.get(column))
+            if is_valid_inn(value):
+                return cache_key(KIND_INN, value)
+    return ""
+
+
 def import_cache_from_output(path: Path) -> dict[str, dict[str, Any]]:
     """
     Восстанавливает кэш из ранее созданного выходного файла (лист "Все").
 
     Нужно, если state-файл потерян: иначе уже сделанные запросы израсходуются повторно.
+    Строка, обработанная с фолбэком на ОГРН, даёт ключ по ОГРН — результат по ИНН
+    в отчёте не сохраняется, поэтому при повторном запуске он будет запрошен снова.
     """
     if not path.exists():
         return {}
@@ -1068,31 +1619,42 @@ def import_cache_from_output(path: Path) -> dict[str, dict[str, Any]]:
         return {}
     if COL_STATUS not in frame.columns:
         return {}
-    inn_column = COL_INN_NORM if COL_INN_NORM in frame.columns else COL_INN
-    if inn_column not in frame.columns:
-        return {}
+
+    def text_of(row: pd.Series, column: str) -> str:
+        """Значение колонки строкой (пусто, если колонки нет или там NaN)."""
+        if column not in frame.columns:
+            return ""
+        value = row.get(column)
+        return "" if value is None or pd.isna(value) else str(value)
 
     cache: dict[str, dict[str, Any]] = {}
     for _, row in frame.iterrows():
-        status = str(row.get(COL_STATUS) or "").strip()
+        status = text_of(row, COL_STATUS).strip()
         if status not in CACHEABLE_STATUSES:
             continue
-        inn = normalize_inn(row.get(inn_column))
-        if not is_valid_inn(inn):
+        key = _restore_key(row)
+        if not key:
             continue
-        extras_raw = row.get(COL_OKVED_EXTRA)
-        extras = [part.strip() for part in str(extras_raw or "").split(";") if part.strip()]
-        name = row.get(COL_NAME)
-        main = row.get(COL_OKVED_MAIN)
-        cache[inn] = {
+        extras = [part.strip() for part in text_of(row, COL_OKVED_EXTRA).split(";") if part.strip()]
+        main = text_of(row, COL_OKVED_MAIN) or text_of(row, COL_OKVED_MAIN_LEGACY)
+        kind = text_of(row, COL_SEARCH_KIND).strip()
+        cache[key] = {
             "status": status,
-            "name": "" if pd.isna(name) else str(name),
-            "okved_main": "" if pd.isna(main) else str(main),
+            "name": text_of(row, COL_NAME),
+            "okved_main": main,
             "okved_extra": extras,
             "error": "",
             "used": None,
-            "date": "" if pd.isna(row.get(COL_DATE)) else str(row.get(COL_DATE)),
+            "date": text_of(row, COL_DATE),
             "from_cache": True,
+            "search_kind": kind,
+            "reason": text_of(row, COL_REASON).strip(),
+            "cache_key": key,
+            "fallback": text_of(row, COL_FALLBACK).strip().lower() in ("да", "yes", "true"),
+            "found_inn": text_of(row, COL_FOUND_INN),
+            "found_ogrn": text_of(row, COL_FOUND_OGRN),
+            "found_ogrnip": text_of(row, COL_FOUND_OGRNIP),
+            "found_kpp": text_of(row, COL_FOUND_KPP),
         }
     return cache
 
@@ -1106,15 +1668,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Описывает интерфейс командной строки."""
     parser = argparse.ArgumentParser(
         prog="dadata_okved_filter.py",
-        description="Выгрузка организаций из DaData по списку ИНН и фильтр по ОКВЭД 56/46.",
+        description=(
+            "Выгрузка организаций из DaData по списку ИНН/ОГРН и фильтр по ОКВЭД 56/46. "
+            "По умолчанию ищет по ИНН, а ОГРН/ОГРНИП использует только если ИНН пустой, "
+            "невалидный или не нашёл организацию (при --fallback-to-ogrn)."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog="Пример: python3 dadata_okved_filter.py --input список_инн.xlsx --output результат.xlsx",
+        epilog=(
+            "Примеры: "
+            "1) python dadata_okved_filter.py --input список.xlsx --output результат.xlsx "
+            "--search-by auto --prefer inn; "
+            "2) то же с --prefer ogrn (сначала ОГРН); "
+            "3) --prefer inn --fallback-to-ogrn (после not_found по ИНН пробовать ОГРН); "
+            "4) --inn-column \"ИНН компании\" --ogrn-column \"ОГРН\" — если колонки названы иначе."
+        ),
     )
-    parser.add_argument("--input", required=True, help="Входной Excel-файл со списком ИНН")
+    parser.add_argument("--input", required=True, help="Входной Excel-файл со списком ИНН и/или ОГРН")
     parser.add_argument("--output", default=None,
                         help="Выходной Excel-файл (по умолчанию <входной>_dadata.xlsx рядом с входным)")
     parser.add_argument("--sheet", default=None, help="Имя листа (по умолчанию первый лист)")
-    parser.add_argument("--column", default=COL_INN, help="Имя колонки с ИНН")
+    parser.add_argument("--search-by", choices=(SEARCH_BY_AUTO,), default=SEARCH_BY_AUTO,
+                        help="Режим выбора идентификатора: auto — сам находит колонки ИНН/ОГРН/ОГРНИП")
+    parser.add_argument("--prefer", choices=(PREFER_INN, PREFER_OGRN), default=PREFER_INN,
+                        help="Что искать первым, если в строке есть и ИНН, и ОГРН: inn (ИНН) или ogrn (ОГРН)")
+    parser.add_argument("--fallback-to-ogrn", action="store_true",
+                        help="Если поиск по ИНН дал not_found/error/timeout, повторить по ОГРН из той же строки")
+    parser.add_argument("--inn-column", default=None,
+                        help="Колонка с ИНН (иначе определяется автоматически)")
+    parser.add_argument("--ogrn-column", default=None,
+                        help="Колонка с ОГРН/ОГРНИП (иначе определяется автоматически)")
+    parser.add_argument("--column", default=None,
+                        help="Устаревший синоним --inn-column (оставлен для совместимости)")
     parser.add_argument("--token", default=None, help="Токен DaData (иначе берётся из DADATA_TOKEN)")
     parser.add_argument("--only-main", action="store_true",
                         help="Фильтровать только по основному ОКВЭД (иначе — по основному и дополнительным)")
@@ -1158,6 +1742,17 @@ def run(args: argparse.Namespace) -> int:
     """Основной сценарий. Возвращает код выхода."""
     configure_logging(args.verbose)
     started = time.monotonic()
+
+    if args.column and not args.inn_column:
+        LOG.warning(
+            "--column устарел, используйте --inn-column: значение %r принято как колонка ИНН.",
+            args.column,
+        )
+        args.inn_column = args.column
+    if args.fallback_to_ogrn and args.prefer == PREFER_OGRN:
+        LOG.warning(
+            "--fallback-to-ogrn не действует при --prefer ogrn: поиск и так идёт по ОГРН первым."
+        )
 
     try:
         validate_api_url(args.api_url)
@@ -1227,16 +1822,19 @@ def _execute(
     state = StateStore.load(state_path, today, resume=args.resume)
     if not args.resume and (state.cache or state.processed or state.used_today):
         LOG.warning(
-            "--no-resume: кэш и список обработанных ИНН игнорируются, "
+            "--no-resume: кэш и список обработанных идентификаторов игнорируются, "
             "но суточный счётчик сохранён (уже использовано: %d).", state.used_today,
         )
     if state.day_reset:
         LOG.info("Новый день (%s): суточный счётчик запросов обнулён.", today)
 
-    src_df, inns = read_input(input_path, args.sheet, args.column)
+    src_df, identifiers, columns = read_input(
+        input_path, args.sheet, args.inn_column, args.ogrn_column, args.prefer
+    )
+    args.inn_column, args.ogrn_column = columns.inn, columns.ogrn
     if args.limit and args.limit > 0:
         src_df = src_df.iloc[: args.limit].reset_index(drop=True)
-        inns = inns[: args.limit]
+        identifiers = identifiers[: args.limit]
         LOG.info("Ограничение --limit: обрабатываются первые %d строк", args.limit)
 
     total_rows = len(src_df)
@@ -1244,64 +1842,82 @@ def _execute(
     counters = MatchCounters(prefixes)
 
     valid_indices: list[int] = []
-    empty_count = invalid_count = 0
-    for idx, inn in enumerate(inns):
-        if not inn:
-            empty_count += 1
-            records[idx] = {"status": ST_EMPTY_INN, "error": "пустой ИНН"}
-            continue
-        if not is_valid_inn(inn):
-            invalid_count += 1
-            records[idx] = {"status": ST_INVALID_INN, "error": f"невалидный ИНН: {inn!r}"}
-            continue
-        if state.cache.get(inn):
-            valid_indices.append(idx)
+    invalid_id_count = 0
+    for idx, ident in enumerate(identifiers):
+        if not ident.kind:
+            # Ни ИНН, ни ОГРН не годятся: запрос не отправляем, суточную квоту не тратим.
+            invalid_id_count += 1
+            records[idx] = {
+                "status": ST_INVALID_ID,
+                "error": ident.reason or "нет валидного идентификатора",
+                "reason": ident.reason,
+                "search_kind": "",
+                "fallback": False,
+            }
             continue
         valid_indices.append(idx)
 
+    to_process = len(valid_indices)
+    unique_ids = len({identifiers[idx].key for idx in valid_indices})
     resumed_from_cache = 0
     run_cache: dict[str, dict[str, Any]] = {}
     for idx in valid_indices:
-        cached = state.cache.get(inns[idx])
+        cached = state.cache.get(identifiers[idx].key)
         if cached:
-            run_cache[inns[idx]] = cached
+            run_cache[identifiers[idx].key] = cached
             resumed_from_cache += 1
 
     if not state.cache and args.resume:
         recovered = import_cache_from_output(output_path)
         if recovered:
             state.cache.update(recovered)
-            for inn in recovered:
-                state.mark_processed(inn)
-            LOG.info("Кэш восстановлен из %s: %d ИНН (запросы по ним повторно не пойдут).",
+            for key in recovered:
+                state.mark_processed(key)
+            LOG.info("Кэш восстановлен из %s: %d идентификаторов (запросы по ним повторно не пойдут).",
                      output_path, len(recovered))
             resumed_from_cache = 0
             run_cache = {}
             for idx in valid_indices:
-                cached = state.cache.get(inns[idx])
+                cached = state.cache.get(identifiers[idx].key)
                 if cached:
-                    run_cache[inns[idx]] = cached
+                    run_cache[identifiers[idx].key] = cached
                     resumed_from_cache += 1
 
-    to_request = sum(1 for idx in valid_indices if not state.cache.get(inns[idx]))
-    unique_to_request = len({inns[idx] for idx in valid_indices if not state.cache.get(inns[idx])})
+    pending_keys = [
+        identifiers[idx].key for idx in valid_indices
+        if not state.cache.get(identifiers[idx].key)
+    ]
+    to_request = len(pending_keys)
+    unique_to_request = len(set(pending_keys))
     budget = max(0, args.daily_limit - state.used_today)
 
     LOG.info("=" * 90)
     LOG.info("DaData: фильтрация организаций по ОКВЭД %s", "/".join(prefixes))
     LOG.info("Вход: %s | Выход: %s", input_path, output_path)
     LOG.info("Токен: %s | endpoint: %s", mask_token(token), args.api_url)
+    LOG.info("Колонки идентификаторов: %s", columns.describe())
+    for label, column, validator in (
+        ("ИНН", columns.inn, is_valid_inn),
+        ("ОГРН/ОГРНИП", columns.ogrn, ogrn_kind),
+        ("Идентификатор (слабый кандидат)", columns.weak,
+         lambda value: bool(is_valid_inn(value) or ogrn_kind(value))),
+    ):
+        if column:
+            LOG.info("  колонка %s: %r — валидных значений %d из %d",
+                     label, column, _count_valid(src_df, column, validator), total_rows)
     LOG.info(
         "Лимиты: %d запросов/мин (интервал %.1f с), %d запросов/сутки, часовой пояс %s",
         args.max_per_minute, WINDOW_SECONDS / max(1, args.max_per_minute), args.daily_limit, args.timezone,
     )
+    LOG.info("Выбор идентификатора: search-by=%s, prefer=%s, fallback-to-ogrn=%s",
+             args.search_by, args.prefer, args.fallback_to_ogrn)
     LOG.info("Режим: resume=%s, only-main=%s, limit=%s, dry-run=%s, state: %s",
              args.resume, args.only_main, args.limit or "все", args.dry_run, state_path)
     LOG.info("=" * 90)
-    LOG.info("Строк в файле: %d | валидных: %d (уникальных %d) | невалидных: %d | пустых: %d",
-             total_rows, len(valid_indices), len({inns[idx] for idx in valid_indices}),
-             invalid_count, empty_count)
-    LOG.info("Из кэша (обработано ранее): %d строк | новых ИНН к запросу: %d", resumed_from_cache, unique_to_request)
+    LOG.info("Строк в файле: %d | с идентификатором: %d (уникальных %d) | без валидного идентификатора: %d",
+             total_rows, to_process, unique_ids, invalid_id_count)
+    LOG.info("Из кэша (обработано ранее): %d строк | новых идентификаторов к запросу: %d",
+             resumed_from_cache, unique_to_request)
     LOG.info("Остаток на сегодня: %d запросов из %d (дата %s)", budget, args.daily_limit, today)
     if unique_to_request:
         LOG.info("Примерное время обработки при %d rpm: %s",
@@ -1310,20 +1926,28 @@ def _execute(
     if args.dry_run:
         for idx in valid_indices:
             if records[idx] is None:
-                records[idx] = {"status": ST_DRY_RUN, "error": "запросы не отправлялись (--dry-run)",
-                                "date": iso_now(tz)}
+                ident = identifiers[idx]
+                records[idx] = {
+                    "status": ST_DRY_RUN,
+                    "error": "запросы не отправлялись (--dry-run)",
+                    "date": iso_now(tz),
+                    "search_kind": ident.kind,
+                    "reason": ident.reason,
+                    "cache_key": ident.key,
+                    "fallback": False,
+                }
         LOG.warning("DRY-RUN: запросы к DaData не отправлялись, state-файл не изменялся.")
         LOG.info(
-            "План: %d строк, из них %d валидных ИНН требуют запроса (%d уникальных), "
-            "%d невалидных и %d пустых — без запросов.",
-            total_rows, to_request, unique_to_request, invalid_count, empty_count,
+            "План: %d строк, из них %d требуют запроса (%d уникальных), "
+            "%d без валидного идентификатора — без запросов.",
+            total_rows, to_request, unique_to_request, invalid_id_count,
         )
-        df_all = build_results_df(src_df, inns, records, prefixes)
+        df_all = build_results_df(src_df, identifiers, records, prefixes)
         flag = COL_MATCH_MAIN if args.only_main else COL_MATCH_ANY
         df_filtered = df_all[df_all[flag].fillna(False).astype(bool)]
         stats_rows = build_stats_rows(
-            state, args, counters, total_rows, len(valid_indices), invalid_count, empty_count,
-            resumed_from_cache, 0, len(valid_indices), 0, 0, today, output_path,
+            state, args, counters, total_rows, to_process, invalid_id_count,
+            resumed_from_cache, 0, to_process, 0, 0, today, output_path, columns,
         )
         try:
             write_output(output_path, df_all, df_filtered, stats_rows)
@@ -1360,18 +1984,19 @@ def _execute(
     save_every = max(1, args.save_every)
 
     def build_filtered() -> pd.DataFrame:
-        df_all = build_results_df(src_df, inns, records, prefixes)
+        df_all = build_results_df(src_df, identifiers, records, prefixes)
         flag = COL_MATCH_MAIN if args.only_main else COL_MATCH_ANY
         mask = df_all[flag].fillna(False).astype(bool)
         return df_all, df_all[mask]
 
     def checkpoint(force: bool = False) -> None:
+        fill_known_duplicates()
         state.save()
         df_all, df_filtered = build_filtered()
         stats_rows = build_stats_rows(
-            state, args, counters, total_rows, len(valid_indices), invalid_count, empty_count,
-            resumed_from_cache, rows_processed, len(valid_indices),
-            state.used_today - used_at_start, client.attempts_total, today, output_path,
+            state, args, counters, total_rows, to_process, invalid_id_count,
+            resumed_from_cache, rows_processed, to_process,
+            state.used_today - used_at_start, client.attempts_total, today, output_path, columns,
         )
         try:
             write_output(output_path, df_all, df_filtered, stats_rows)
@@ -1381,20 +2006,105 @@ def _execute(
             if force:
                 LOG.info("Промежуточный результат сохранён: %s", output_path)
 
+    def cached_result(key: str) -> Optional[dict[str, Any]]:
+        """Готовый результат по ключу: из этого запуска или из state-файла (копия)."""
+        if not key:
+            return None
+        cached = run_cache.get(key) or state.cache.get(key)
+        return dict(cached) if cached else None
+
+    def request_by(kind: str, value: str, key: str) -> dict[str, Any]:
+        """
+        Один запрос к DaData по конкретному идентификатору.
+
+        Результат идёт в кэш запуска (дубликаты в файле квоту не тратят) и, если он
+        кэшируемый, в state-файл. Сетевые ошибки в state не пишутся: их нужно повторить
+        в следующий раз, а не запоминать навсегда.
+        """
+        record = client.fetch_party(value, kind)
+        record["used"] = state.used_today
+        record["date"] = iso_now(tz)
+        record["cache_key"] = key
+        record["search_kind"] = kind
+        record["fallback"] = False
+        run_cache[key] = dict(record)
+        if record.get("status") in CACHEABLE_STATUSES:
+            state.put_cache(key, record)
+        return record
+
+    def resolve_row(idx: int) -> dict[str, Any]:
+        """
+        Результат для строки: сначала по основному идентификатору (ИНН или ОГРН),
+        затем — если включён --fallback-to-ogrn и основной поиск не удался —
+        по ОГРН/ОГРНИП из той же строки.
+
+        Проблемы лимитов и авторизации намеренно не перехватываются: их обрабатывает
+        основной цикл, чтобы остановиться и сохранить прогресс.
+        """
+        ident = identifiers[idx]
+        key = ident.key
+        record = cached_result(key)
+        if record is None:
+            record = request_by(ident.kind, ident.value, key)
+        else:
+            record["search_kind"] = record.get("search_kind") or ident.kind
+            record["cache_key"] = record.get("cache_key") or key
+            record.setdefault("fallback", False)
+            enrich_found_from_key(record, key)
+
+        can_fallback = (
+            args.fallback_to_ogrn
+            and bool(ident.fallback_kind)
+            and ident.fallback_kind != ident.kind
+        )
+        if not can_fallback or record.get("status") not in FALLBACK_STATUSES:
+            if not record.get("reason"):
+                record["reason"] = ident.reason
+            return record
+
+        primary_status = record.get("status")
+        fallback_key = ident.fallback_key
+        fallback = cached_result(fallback_key)
+        if fallback is None:
+            LOG.info("Строка %d: поиск по %s %s дал %s — повторяю по %s %s",
+                     idx + 2, ident.kind, ident.value, primary_status,
+                     ident.fallback_kind, ident.fallback_value)
+            fallback = request_by(ident.fallback_kind, ident.fallback_value, fallback_key)
+        fallback = dict(fallback)
+        fallback["search_kind"] = ident.fallback_kind
+        fallback["cache_key"] = fallback_key
+        fallback["fallback"] = True
+        fallback["fallback_from"] = primary_status
+        fallback["reason"] = (
+            REASON_INN_FALLBACK_OGRN if primary_status == ST_NOT_FOUND
+            else REASON_INN_ERROR_FALLBACK_OGRN
+        )
+        return fallback
+
+    def fill_known_duplicates() -> int:
+        """Заполняет строки-дубликаты уже известным результатом этого запуска."""
+        filled = 0
+        for idx in valid_indices:
+            if records[idx] is not None:
+                continue
+            known = run_cache.get(identifiers[idx].key)
+            if known is None:
+                continue
+            clone = dict(known)
+            clone["from_cache"] = True
+            records[idx] = clone
+            counters.add(clone)
+            filled += 1
+        if filled:
+            LOG.info("Дубликаты: %d строк получили результат уже обработанного идентификатора.", filled)
+        return filled
+
     try:
         for position, idx in enumerate(valid_indices, start=1):
             if records[idx] is not None:
-                continue  # строка уже заполнена дубликатом ранее в этом запуске
-            inn = inns[idx]
-            record = run_cache.get(inn)
-            if record is not None:
-                records[idx] = dict(record)
-                counters.add(records[idx])
-                rows_processed += 1
                 continue
-
             try:
-                record = client.fetch_party(inn)
+                record = resolve_row(idx)
             except DailyLimitReached:
                 limit_reached = True
                 break
@@ -1407,24 +2117,8 @@ def _execute(
                 limit_reached = True
                 break
 
-            record["used"] = state.used_today
-            record["date"] = iso_now(tz)
             records[idx] = record
             counters.add(record)
-            run_cache[inn] = record  # дубликаты ИНН больше запросов не тратят
-
-            if record.get("status") in CACHEABLE_STATUSES:
-                state.put_cache(inn, record)
-
-            # Дубликаты того же ИНН ниже по файлу получают тот же результат
-            if record.get("status") in CACHEABLE_STATUSES:
-                for other in valid_indices[position:]:
-                    if inns[other] == inn and records[other] is None:
-                        clone = dict(record)
-                        clone["from_cache"] = True
-                        records[other] = clone
-                        counters.add(clone)
-
             rows_processed += 1
 
             if rows_processed % progress_every == 0 or position == len(valid_indices):
@@ -1466,11 +2160,12 @@ def _execute(
         LOG.error("%s", exc)
         return EXIT_USAGE
 
+    fill_known_duplicates()
     df_all, df_filtered = build_filtered()
     requests_run = state.used_today - used_at_start
     _log_summary(
         state=state, args=args, counters=counters, total_rows=total_rows,
-        valid_count=len(valid_indices), invalid_count=invalid_count, empty_count=empty_count,
+        valid_count=len(valid_indices), invalid_id_count=invalid_id_count,
         resumed=resumed_from_cache, rows_processed=rows_processed,
         plan_size=len(valid_indices), requests_run=requests_run,
         attempts_run=client.attempts_total, started=started, output_path=output_path,
@@ -1524,10 +2219,11 @@ def _log_progress(
     LOG.info(
         "[прогресс] %d/%d строк | запросов в запуске: %d (обращений с повторами: %d) | "
         "за сутки: %d/%d | в окне 60 с: %d/%d | средняя скорость: %s | "
-        "найдено: %d | ошибок: %d | совпадений %s: %d | ETA: %s",
+        "найдено: %d | ошибок: %d | без идентификатора: %d | совпадений %s: %d | ETA: %s",
         rows_processed, total_to_process, requests_run, attempts_run, used_today, daily_limit,
         limiter.requests_in_window(), limiter.max_per_minute,
-        speed_text, counters.found, counters.errors, "/".join(prefixes), counters.match_any,
+        speed_text, counters.found, counters.errors, counters.invalid_id,
+        "/".join(prefixes), counters.match_any,
         human_duration(eta),
     )
 
@@ -1538,8 +2234,7 @@ def build_stats_rows(
     counters: MatchCounters,
     total_rows: int,
     valid_count: int,
-    invalid_count: int,
-    empty_count: int,
+    invalid_id_count: int,
     resumed: int,
     rows_processed: int,
     plan_size: int,
@@ -1547,15 +2242,23 @@ def build_stats_rows(
     attempts_run: int,
     today: str,
     output_path: Path,
+    columns: Optional[IdColumns] = None,
 ) -> list[tuple[str, Any]]:
     """Собирает строки листа «Статистика»."""
     return [
         ("Дата обработки (часовой пояс)", f"{today} ({args.timezone})"),
         ("Всего строк в файле", total_rows),
-        ("Пустых ИНН", empty_count),
-        ("Валидных ИНН", valid_count),
-        ("Невалидных ИНН (проверено локально, без запросов)", invalid_count),
-        ("Уникальных валидных ИНН", plan_size),
+        ("Колонки идентификаторов", columns.describe() if columns else "—"),
+        ("Выбор идентификатора",
+         f"search-by={args.search_by}, prefer={args.prefer}, "
+         f"fallback-to-ogrn={'да' if args.fallback_to_ogrn else 'нет'}"),
+        ("Строк без валидного идентификатора (invalid_id)", invalid_id_count),
+        ("Строк с идентификатором", valid_count),
+        ("Уникальных идентификаторов", plan_size),
+        ("Из них поиск по ИНН", counters.by_kind.get(KIND_INN, 0)),
+        ("Из них поиск по ОГРН (13 цифр)", counters.by_kind.get(KIND_OGRN, 0)),
+        ("Из них поиск по ОГРНИП (15 цифр)", counters.by_kind.get(KIND_OGRNIP, 0)),
+        ("Запросов-фолбэков на ОГРН (--fallback-to-ogrn)", counters.fallbacks),
         ("Уже обработано ранее (взято из кэша)", resumed),
         ("Обработано строк в этом запуске", rows_processed),
         ("Запросов отправлено в этом запуске", requests_run),
@@ -1575,15 +2278,18 @@ def build_stats_rows(
 
 
 def _log_summary(*, state: StateStore, args: argparse.Namespace, counters: MatchCounters,
-                 total_rows: int, valid_count: int, invalid_count: int, empty_count: int,
+                 total_rows: int, valid_count: int, invalid_id_count: int,
                  resumed: int, rows_processed: int, plan_size: int, requests_run: int,
                  attempts_run: int, started: float, output_path: Path, remaining: int) -> None:
     """Печатает итоговую статистику запуска."""
     elapsed = time.monotonic() - started
     LOG.info("-" * 90)
     LOG.info("ИТОГИ")
-    LOG.info("Всего ИНН в файле: %d | валидных: %d | невалидных: %d | пустых: %d",
-             total_rows, valid_count, invalid_count, empty_count)
+    LOG.info("Всего строк в файле: %d | с идентификатором: %d | без валидного идентификатора: %d",
+             total_rows, valid_count, invalid_id_count)
+    LOG.info("Поиск: по ИНН %d | по ОГРН %d | по ОГРНИП %d | фолбэков на ОГРН %d",
+             counters.by_kind.get(KIND_INN, 0), counters.by_kind.get(KIND_OGRN, 0),
+             counters.by_kind.get(KIND_OGRNIP, 0), counters.fallbacks)
     LOG.info("Обработано ранее (кэш): %d | обработано в этом запуске: %d | не обработано: %d",
              resumed, rows_processed, max(0, plan_size - rows_processed))
     LOG.info("Запросов отправлено в этом запуске: %d (обращений с повторами: %d) | за сутки: %d/%d",

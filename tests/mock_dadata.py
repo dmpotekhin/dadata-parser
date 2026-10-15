@@ -19,35 +19,72 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
 
-def _suggestion(inn: str, name: str, okved_main: str, okveds: Any) -> dict[str, Any]:
-    """Формирует ответ в формате DaData suggestions."""
+def _suggestion(
+    inn: str,
+    name: str,
+    okved_main: str,
+    okveds: Any,
+    ogrn: Optional[str] = None,
+    kpp: Optional[str] = None,
+    party_type: str = "LEGAL",
+) -> dict[str, Any]:
+    """
+    Формирует ответ в формате DaData suggestions.
+
+    Как и настоящий API: ОГРН и ОГРНИП приходят в одном поле data.ogrn
+    (13 или 15 цифр), отдельного data.ogrnip нет. Для ИП задавайте ogrn
+    из 15 цифр и party_type="INDIVIDUAL", для юрлица — 13 цифр и "LEGAL".
+    """
+    ogrn_value = ogrn if ogrn is not None else "1" + inn[::-1][:12].ljust(12, "0")
+    data: dict[str, Any] = {
+        "inn": inn,
+        "ogrn": ogrn_value,
+        "type": party_type,
+        "okved": okved_main,
+        "okveds": okveds,
+        "name": {"short_with_opf": name},
+    }
+    if kpp is not None:
+        data["kpp"] = kpp
     return {
         "suggestions": [
             {
                 "value": name,
                 "unrestricted_value": name,
-                "data": {
-                    "inn": inn,
-                    "ogrn": "1" + inn[::-1][:12].ljust(12, "0"),
-                    "okved": okved_main,
-                    "okveds": okveds,
-                    "name": {"short_with_opf": name},
-                },
+                "data": data,
             }
         ]
     }
 
 
-# ИНН -> список реакций (по порядку обращений); последняя используется и далее
+# Запрос (ИНН, ОГРН или ОГРНИП) -> список реакций (по порядку обращений);
+# последняя используется и далее. Ключи — те же значения, что уходят в {"query": ...}.
 BEHAVIORS: dict[str, list[dict[str, Any]]] = {
     "7707083893": [{"kind": "json", "body": _suggestion("7707083893", 'ООО "Ромашка"', "56.10",
                                                         [{"code": "46.90", "main": False},
-                                                         {"code": "62.01", "main": False}])}],
+                                                         {"code": "62.01", "main": False}],
+                                                        ogrn="1027700000000",
+                                                        kpp="770701001")}],
     "500100732259": [{"kind": "json", "body": _suggestion("500100732259", 'ИП Кузнецов А.А.', "46.73",
-                                                          [{"code": "43.21"}])}],
+                                                          [{"code": "43.21"}],
+                                                          ogrn="326547600194488",
+                                                          party_type="INDIVIDUAL")}],
     "7830002293": [{"kind": "json", "body": _suggestion("7830002293", 'ООО "Лютик"', "62.01",
                                                         ["71.12", "46.90"])}],
+    # ОГРН/ОГРНИП-ключи: по ним тоже ищут (findById/party принимает оба формата)
+    "1027700000000": [{"kind": "json", "body": _suggestion("7707083893", 'ООО "Ромашка"', "56.10",
+                                                           [{"code": "46.90", "main": False}],
+                                                           ogrn="1027700000000",
+                                                           kpp="770701001")}],
+    "326547600194488": [{"kind": "json", "body": _suggestion("500100732259", 'ИП Кузнецов А.А.', "46.73",
+                                                             [{"code": "43.21"}],
+                                                             ogrn="326547600194488",
+                                                             party_type="INDIVIDUAL")}],
     "1234567890": [{"kind": "json", "body": {"suggestions": []}}],
+    # ИНН есть в списке, но в реестре не найден, а ОГРН из той же строки — находится
+    "1027700009999": [{"kind": "json", "body": _suggestion("7707083893", 'ООО "Ромашка"', "56.10",
+                                                           [{"code": "46.90"}],
+                                                           ogrn="1027700009999")}],
     "9999999999": [{"kind": "status", "code": 500, "text": "internal error"},
                    {"kind": "status", "code": 500, "text": "internal error"},
                    {"kind": "json", "body": _suggestion("9999999999", 'ООО "Пятый"', "56.20", [])}],
@@ -69,18 +106,18 @@ DEFAULT_BEHAVIOR: list[dict[str, Any]] = [
 
 
 class Stats:
-    """Собирает обращения к мок-серверу."""
+    """Собирает обращения к мок-серверу (значение query: ИНН, ОГРН или ОГРНИП)."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.times: list[float] = []
-        self.inns: list[str] = []
+        self.queries: list[str] = []
         self.statuses: list[int] = []
 
-    def add(self, inn: str, status: int) -> None:
+    def add(self, query: str, status: int) -> None:
         with self.lock:
             self.times.append(time.monotonic())
-            self.inns.append(inn)
+            self.queries.append(query)
             self.statuses.append(status)
 
     def snapshot(self) -> dict[str, Any]:
@@ -88,7 +125,8 @@ class Stats:
             return {
                 "total": len(self.times),
                 "times": list(self.times),
-                "inns": list(self.inns),
+                "queries": list(self.queries),
+                "inns": list(self.queries),  # прежнее имя ключа, оставлено для совместимости
                 "statuses": list(self.statuses),
             }
 

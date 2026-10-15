@@ -145,15 +145,15 @@ class CliIntegrationTest(unittest.TestCase):
             self.assertEqual(by_inn["7707083893"], "ok")
             self.assertEqual(by_inn["500100732259"], "ok")
             self.assertEqual(by_inn["1234567890"], "not_found")
-            self.assertEqual(by_inn["12345"], "invalid_inn")
-            self.assertEqual(by_inn[""], "empty_inn")
+            self.assertEqual(by_inn["12345"], "invalid_id")
+            self.assertEqual(by_inn[""], "invalid_id")
             self.assertEqual(by_inn["6666666666"], "error")
             self.assertEqual(by_inn["5555555555"], "error")
 
             row = all_sheet.iloc[0]
             self.assertIn("Ромашка", row["Название"])
-            self.assertEqual(row["ОКВЭД основной"], "56.10")
-            self.assertEqual(row["ОКВЭД дополнительные"], "46.90; 62.01")
+            self.assertEqual(row["Основной ОКВЭД"], "56.10")
+            self.assertEqual(row["Дополнительные ОКВЭД"], "46.90; 62.01")
             self.assertEqual(row["Совпадает основной"], "True")
             self.assertEqual(row["Совпадает любой"], "True")
             # Строка 3: основной 62.01 не подходит, дополнительный 46.90 — подходит
@@ -161,7 +161,7 @@ class CliIntegrationTest(unittest.TestCase):
             self.assertEqual(third["Совпадает основной"], "False")
             self.assertEqual(third["Совпадает любой"], "True")
             # Строка 13: okveds = null -> дополнительные пустые
-            self.assertTrue(pd.isna(all_sheet.iloc[12]["ОКВЭД дополнительные"]))
+            self.assertTrue(pd.isna(all_sheet.iloc[12]["Дополнительные ОКВЭД"]))
             self.assertEqual(all_sheet.iloc[12]["Совпадает основной"], "True")
             # Ошибки записаны в колонку "Ошибка"
             self.assertIn("invalid_json", str(all_sheet.iloc[10]["Ошибка"]))
@@ -256,7 +256,7 @@ class CliLimitAndResumeTest(unittest.TestCase):
             self.assertEqual(by_inn["7707083893"], "ok")
             self.assertEqual(by_inn["9999999999"], "pending")
             # Недоделанные строки остаются в статусе pending (6 из 13: остальные — ok/not_found/
-            # invalid_inn/empty_inn либо дубликат уже обработанного ИНН)
+            # invalid_id либо дубликат уже обработанного идентификатора)
             pending_rows = (all_sheet["Статус"] == "pending").sum()
             self.assertEqual(pending_rows, 6, f"pending строк: {pending_rows}")
 
@@ -291,8 +291,8 @@ class CliDryRunTest(unittest.TestCase):
 
             by_inn = statuses_by_inn(read_sheets(out)["Все"])
             self.assertEqual(by_inn["7707083893"], "dry_run")
-            self.assertEqual(by_inn["12345"], "invalid_inn")
-            self.assertEqual(by_inn[""], "empty_inn")
+            self.assertEqual(by_inn["12345"], "invalid_id")
+            self.assertEqual(by_inn[""], "invalid_id")
 
 
 class CliInterruptTest(unittest.TestCase):
